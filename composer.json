@@ -1,5 +1,5 @@
 {
-    "name": "cooker/mail",
+    "name": "cooker/email",
     "type": "library",
     "license": "LGPL-3.0",
     "autoload": {
