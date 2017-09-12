@@ -1,5 +1,5 @@
 {
-    "name": "cooker/email",
+    "name": "cooker/mail",
     "type": "library",
     "license": "LGPL-3.0",
     "autoload": {
@@ -8,7 +8,8 @@
         }
     },
     "require": {
-        "php": ">=5.6"
+        "php": ">=5.6",
+        "pear/net_smtp": "1.7"
     },
-     "minimum-stability": "dev"
+     "minimum-stability": "stable"
 }

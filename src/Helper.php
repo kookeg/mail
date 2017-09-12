@@ -234,7 +234,7 @@ class Helper
      *
      * @return boolean True if found, False if not
      */
-   public static function in_array_nocase($needle, $haystack)
+    public static function in_array_nocase($needle, $haystack)
     {
         // use much faster method for ascii
         if (self::is_ascii($needle)) {
@@ -271,4 +271,31 @@ class Helper
     }
 
 
+    /**
+     * Explode quoted string
+     *
+     * @param string Delimiter expression string for preg_match()
+     * @param string Input string
+     *
+     * @return array String items
+     */
+    public static function explode_quoted_string($delimiter, $string)
+    {
+        $result = array();
+        $strlen = strlen($string);
+
+        for ($q=$p=$i=0; $i < $strlen; $i++) {
+            if ($string[$i] == "\"" && $string[$i-1] != "\\") {
+                $q = $q ? false : true;
+            }
+            else if (!$q && preg_match("/$delimiter/", $string[$i])) {
+                $result[] = substr($string, $p, $i - $p);
+                $p = $i + 1;
+            }
+        }
+
+        $result[] = (string) substr($string, $p);
+
+        return $result;
+    }
 }
