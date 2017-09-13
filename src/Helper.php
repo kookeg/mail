@@ -495,7 +495,7 @@ class Helper
             $domain = $input;
         }
 
-        $domain = $is_utf ? idn_to_ascii($domain) : idn_to_utf8($domain);
+        $domain = $is_utf ? self::idn_to_ascii($domain) : self::idn_to_utf8($domain);
 
         if ($domain === false) {
             return '';
@@ -616,4 +616,48 @@ class Helper
         return $str;
     }  
 
+
+/**
+ * intl replacement functions
+ */
+
+    public static function cidn_to_utf8($domain)
+    {
+        static $idn, $loaded;
+
+        if (!$loaded) {
+            $idn    = new Net_IDNA2();
+            $loaded = true;
+        }
+
+        if ($idn && $domain && preg_match('/(^|\.)xn--/i', $domain)) {
+            try {
+                $domain = $idn->decode($domain);
+            }
+            catch (Exception $e) {
+            }
+        }
+
+        return $domain;
+    }
+
+    public static function cidn_to_ascii($domain)
+    {
+        static $idn, $loaded;
+
+        if (!$loaded) {
+            $idn    = new Net_IDNA2();
+            $loaded = true;
+        }
+
+        if ($idn && $domain && preg_match('/[^\x20-\x7E]/', $domain)) {
+            try {
+                $domain = $idn->encode($domain);
+            }
+            catch (Exception $e) {
+            }
+        }
+
+        return $domain;
+    }
 }
