@@ -847,7 +847,7 @@ class Mime
      */
     public static function fix_email($email)
     {
-        $parts = Utils::explode_quoted_string('@', $email);
+        $parts = Helper::explode_quoted_string('@', $email);
         foreach ($parts as $idx => $part) {
             // remove redundant quoting (#1490040)
             if ($part[0] == '"' && preg_match('/^"([a-zA-Z0-9._+=-]+)"$/', $part, $m)) {

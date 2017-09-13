@@ -127,6 +127,14 @@ class GlobalVar
         'smtp_default_host' => 'localhost',
     
     
+        'message_sort_col' => 'date',
+        'list_cols'        => array('subject', 'status', 'fromto', 'date', 'size', 'flag', 'attachment'),
+        'date_format'      => 'Y-m-d',
+        'date_formats'     => array('Y-m-d', 'Y/m/d', 'Y.m.d', 'd-m-Y', 'd/m/Y', 'd.m.Y', 'j.n.Y'),
+        'time_format'  => 'H:i',
+        'time_formats' => array('G:i', 'H:i', 'g:i a', 'h:i A'),
+        'date_long'    => 'Y-m-d H:i',
+        'date_short'   => 'D H:i',
     
     
     );

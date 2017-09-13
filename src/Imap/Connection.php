@@ -23,6 +23,7 @@ class Connection
 
     protected $capability = array();
 
+    protected $resultcode = '';
 
 
     const DEBUG_LINE_LENGTH = 4098; // 4KB + 2B for \r\n
@@ -63,20 +64,20 @@ class Connection
             if($authMethod == 'AUTH'){
                 $authMethod = 'CRAM-MD5';
             }
-        
+
         }
         switch($authMethod){
-            case 'CRAM-MD5':
-            case 'DIGEST-MD5': 
-            case 'GSSAPI':
-            case 'PLAIN':
-                $result = $this->authenticate($user, $password, $authMethod);
-                break;
-            case 'LOGIN':
-                $result = $this->login($user, $password);
-                break;
-            default:
-                $this->setError(Error::ERROR_BAD, "Configuration error. Unknown auth method: $authMethod");
+        case 'CRAM-MD5':
+        case 'DIGEST-MD5': 
+        case 'GSSAPI':
+        case 'PLAIN':
+            $result = $this->authenticate($user, $password, $authMethod);
+            break;
+        case 'LOGIN':
+            $result = $this->login($user, $password);
+            break;
+        default:
+            $this->setError(Error::ERROR_BAD, "Configuration error. Unknown auth method: $authMethod");
         }
         if(isset($result) && is_resource($result)){
             if(GlobalVar::get('imap_force_caps')){
@@ -932,4 +933,656 @@ class Connection
         return array();
     } 
 
+
+    public function search($mailbox, $query, $returnUid = false, $items = array())
+    {
+        if(!$this->select($mailbox)){
+            return new ResultIndex($mailbox);
+        }         
+
+        if (!$this->data['EXISTS']) {
+            return new ResultIndex($mailbox, '* SEARCH');
+        }
+
+        // If ESEARCH is supported always use ALL
+        // but not when items are specified or using simple id2uid search
+        if (empty($items) && preg_match('/[^0-9]/', $query)) {
+            $items = array('ALL');
+        }
+
+        $esearch  = empty($items) ? false : $this->getCapability('ESEARCH');
+        $query    = trim($query);
+        $params   = '';
+
+        // RFC4731: ESEARCH
+        if (!empty($items) && $esearch) {
+            $params .= 'RETURN (' . implode(' ', $items) . ')';
+        }
+
+        if (!empty($query)) {
+            $params .= ($params ? ' ' : '') . $query;
+        }
+        else {
+            $params .= 'ALL';
+        }
+
+        list($code, $response) = $this->execute($returnUid ? 'UID SEARCH' : 'SEARCH', array($params));
+
+        $response = $code != Error::ERROR_OK ? null : $response;
+        return new ResultIndex($mailbox, $response);
+    }
+
+    public function select($mailbox, $qresyncData = array())
+    {
+        if(!$mailbox){
+            return false;
+        } 
+        $params = array(Helper::escape($mailbox));  
+        if(!empty($qresyncData)){
+            if(isset($qresyncData[2]) && $qresyncData[2]){
+                $qresyncData[2] = Helper::compressMessageSet($qresyncData[2]); 
+            }
+            $params[] = array('QRESYNC', $qresyncData);
+        }
+        list($code, $response) = $this->execute('SELECT', $params); 
+        if($code == Error::ERROR_OK){
+            $response = explode("\r\n", $response);
+            foreach ($response as $line) {
+                if (preg_match('/^\* OK \[/i', $line)) {
+                    $pos   = strcspn($line, ' ]', 6);
+                    $token = strtoupper(substr($line, 6, $pos));
+                    $pos   += 7;
+
+                    switch ($token) {
+                    case 'UIDNEXT':
+                    case 'UIDVALIDITY':
+                    case 'UNSEEN':
+                        if ($len = strspn($line, '0123456789', $pos)) {
+                            $this->data[$token] = (int) substr($line, $pos, $len);
+                        }
+                        break;
+
+                    case 'HIGHESTMODSEQ':
+                        if ($len = strspn($line, '0123456789', $pos)) {
+                            $this->data[$token] = (string) substr($line, $pos, $len);
+                        }
+                        break;
+
+                    case 'NOMODSEQ':
+                        $this->data[$token] = true;
+                        break;
+
+                    case 'PERMANENTFLAGS':
+                        $start = strpos($line, '(', $pos);
+                        $end   = strrpos($line, ')');
+                        if ($start && $end) {
+                            $flags = substr($line, $start + 1, $end - $start - 1);
+                            $this->data[$token] = explode(' ', $flags);
+                        }
+                        break;
+                    }
+                }else if (preg_match('/^\* ([0-9]+) (EXISTS|RECENT|FETCH)/i', $line, $match)) {
+                    $token = strtoupper($match[2]);
+                    switch ($token) {
+                    case 'EXISTS':
+                    case 'RECENT':
+                        $this->data[$token] = (int) $match[1];
+                        break;
+
+                    case 'FETCH':
+                        // QRESYNC FETCH response (RFC5162)
+                        $line       = substr($line, strlen($match[0]));
+                        $fetch_data = Helper::tokenizeResponse($line, 1);
+                        $data       = array('id' => $match[1]);
+
+                        for ($i=0, $size=count($fetch_data); $i<$size; $i+=2) {
+                            $data[strtolower($fetch_data[$i])] = $fetch_data[$i+1];
+                        }
+
+                        $this->data['QRESYNC'][$data['uid']] = $data;
+                        break;
+                    }
+                }else if (preg_match('/^\* VANISHED [()EARLIER]*/i', $line, $match)) {
+                    // QRESYNC VANISHED response (RFC5162)
+                    $line   = substr($line, strlen($match[0]));
+                    $v_data = Helper::tokenizeResponse($line, 1);
+
+                    $this->data['VANISHED'] = $v_data;
+                }
+            } 
+            $this->data['READ-WRITE'] = $this->resultcode != 'READ-ONLY';
+            return true;
+        }
+        return false;
+    }
+
+
+    /**
+     * Executes SORT command
+     *
+     * @param string $mailbox    Mailbox name
+     * @param string $field      Field to sort by (ARRIVAL, CC, DATE, FROM, SIZE, SUBJECT, TO)
+     * @param string $criteria   Searching criteria
+     * @param bool   $returnUid Enables UID SORT usage
+     * @param string $encoding   Character set
+     *
+     * @return ResultIndex Response data
+     */
+    public function sort(
+        $mailbox
+        , $field = 'ARRIVAL'
+        , $criteria = ''
+        , $returnUid = false
+        , $encoding = 'US-ASCII'
+    )
+    {
+        $supported = array('ARRIVAL', 'CC', 'DATE', 'FROM', 'SIZE', 'SUBJECT', 'TO');
+        $field     = strtoupper($field);
+        $field     = $field == 'INTERNALDATE' ? 'ARRIVAL' : $field;
+
+
+        if (!in_array($field, $supported)) {
+            return new ResultIndex($mailbox);
+        }
+
+        if (!$this->select($mailbox)) {
+            return new ResultIndex($mailbox);
+        }
+
+        if (!$this->data['EXISTS']) {
+            return new ResultIndex($mailbox, '* SORT');
+        }
+
+        // RFC 5957: SORT=DISPLAY
+        if (($field == 'FROM' || $field == 'TO') && $this->getCapability('SORT=DISPLAY')) {
+            $field = 'DISPLAY' . $field;
+        }
+
+        $encoding = $encoding ? trim($encoding) : 'US-ASCII';
+        $criteria = $criteria ? 'ALL ' . trim($criteria) : 'ALL';
+
+        list($code, $response) = $this->execute(
+            $returnUid ? 'UID SORT' : 'SORT'
+            , array("($field)", $encoding, $criteria)
+        );
+
+        $response = $code != Error::ERROR_OK ? null : $response;
+        return new ResultIndex($mailbox, $response);
+    }
+
+
+    /**
+     * Simulates SORT command by using FETCH and sorting.
+     *
+     * @param string       $mailbox      Mailbox name
+     * @param string|array $message_set  Searching criteria (list of messages to return)
+     * @param string       $index_field  Field to sort by (ARRIVAL, CC, DATE, FROM, SIZE, SUBJECT, TO)
+     * @param bool         $skip_deleted Makes that DELETED messages will be skipped
+     * @param bool         $uidfetch     Enables UID FETCH usage
+     * @param bool         $returnUid   Enables returning UIDs instead of IDs
+     *
+     * @return ResultIndex Response data
+     */
+    public function index(
+        $mailbox
+        , $message_set
+        , $index_field  = ''
+        , $skip_deleted = true
+        , $uidfetch     = false
+        , $returnUid    = false
+    )
+    {
+        $msg_index = $this->fetchHeaderIndex(
+            $mailbox
+            , $message_set
+            , $index_field
+            , $skip_deleted
+            , $uidfetch
+            , $returnUid
+        );
+
+        if (!empty($msg_index)) {
+            asort($msg_index); // ASC
+            $msg_index = array_keys($msg_index);
+            $msg_index = '* SEARCH ' . implode(' ', $msg_index);
+        }else {
+            $msg_index = is_array($msg_index) ? '* SEARCH' : null;
+        }
+
+        return new ResultIndex($mailbox, $msg_index);
+    }
+
+    /**
+     * Fetches specified header/data value for a set of messages.
+     *
+     * @param string       $mailbox      Mailbox name
+     * @param string|array $message_set  Searching criteria (list of messages to return)
+     * @param string       $index_field  Field to sort by (ARRIVAL, CC, DATE, FROM, SIZE, SUBJECT, TO)
+     * @param bool         $skip_deleted Makes that DELETED messages will be skipped
+     * @param bool         $uidfetch     Enables UID FETCH usage
+     * @param bool         $returnUid   Enables returning UIDs instead of IDs
+     *
+     * @return array|bool List of header values or False on failure
+     */
+    public function fetchHeaderIndex(
+        $mailbox
+        , $message_set
+        , $index_field  = ''
+        , $skip_deleted = true
+        , $uidfetch     = false
+        , $returnUid    = false
+    )
+    {
+        if (is_array($message_set)) {
+            if (!($message_set = Helper::compressMessageSet($message_set))) {
+                return false;
+            }
+        }else {
+            list($from_idx, $to_idx) = explode(':', $message_set);
+            if (empty($message_set) || (isset($to_idx) && $to_idx != '*' && (int)$from_idx > (int)$to_idx)
+            ) {
+                return false;
+            }
+        }
+
+        $index_field = empty($index_field) ? 'DATE' : strtoupper($index_field);
+
+        $fields_a['DATE']         = 1;
+        $fields_a['INTERNALDATE'] = 4;
+        $fields_a['ARRIVAL']      = 4;
+        $fields_a['FROM']         = 1;
+        $fields_a['REPLY-TO']     = 1;
+        $fields_a['SENDER']       = 1;
+        $fields_a['TO']           = 1;
+        $fields_a['CC']           = 1;
+        $fields_a['SUBJECT']      = 1;
+        $fields_a['UID']          = 2;
+        $fields_a['SIZE']         = 2;
+        $fields_a['SEEN']         = 3;
+        $fields_a['RECENT']       = 3;
+        $fields_a['DELETED']      = 3;
+
+        if (!($mode = $fields_a[$index_field])) {
+            return false;
+        }
+
+        //  Select the mailbox
+        if (!$this->select($mailbox)) {
+            return false;
+        }
+
+        // build FETCH command string
+        $key    = $this->nextTag();
+        $cmd    = $uidfetch ? 'UID FETCH' : 'FETCH';
+        $fields = array();
+
+        if ($returnUid) {
+            $fields[] = 'UID';
+        }
+        if ($skip_deleted) {
+            $fields[] = 'FLAGS';
+        }
+
+        if ($mode == 1) {
+            if ($index_field == 'DATE') {
+                $fields[] = 'INTERNALDATE';
+            }
+            $fields[] = "BODY.PEEK[HEADER.FIELDS ($index_field)]";
+        }
+        else if ($mode == 2) {
+            if ($index_field == 'SIZE') {
+                $fields[] = 'RFC822.SIZE';
+            }
+            else if (!$returnUid || $index_field != 'UID') {
+                $fields[] = $index_field;
+            }
+        }
+        else if ($mode == 3 && !$skip_deleted) {
+            $fields[] = 'FLAGS';
+        }
+        else if ($mode == 4) {
+            $fields[] = 'INTERNALDATE';
+        }
+
+        $request = "$key $cmd $message_set (" . implode(' ', $fields) . ")";
+
+        if (!$this->putLine($request)) {
+            $this->setError(Error::ERROR_COMMAND, "Failed to send $cmd command");
+            return false;
+        }
+        $result = array();
+        do {
+            $line = rtrim($this->readLine(200));
+            $line = $this->multLine($line);
+
+            if (preg_match('/^\* ([0-9]+) FETCH/', $line, $m)) {
+                $id     = $m[1];
+                $flags  = null;
+
+                if ($returnUid) {
+                    if (preg_match('/UID ([0-9]+)/', $line, $matches)) {
+                        $id = (int) $matches[1];
+                    }
+                    else {
+                        continue;
+                    }
+                }
+                if ($skip_deleted && preg_match('/FLAGS \(([^)]+)\)/', $line, $matches)) {
+                    $flags = explode(' ', strtoupper($matches[1]));
+                    if (in_array('\\DELETED', $flags)) {
+                        continue;
+                    }
+                }
+
+                if ($mode == 1 && $index_field == 'DATE') {
+                    if (preg_match('/BODY\[HEADER\.FIELDS \("*DATE"*\)\] (.*)/', $line, $matches)) {
+                        $value = preg_replace(array('/^"*[a-z]+:/i'), '', $matches[1]);
+                        $value = trim($value);
+                        $result[$id] = Helper::strtotime($value);
+                    }
+                    // non-existent/empty Date: header, use INTERNALDATE
+                    if (empty($result[$id])) {
+                        if (preg_match('/INTERNALDATE "([^"]+)"/', $line, $matches)) {
+                            $result[$id] = Helper::strtotime($matches[1]);
+                        }
+                        else {
+                            $result[$id] = 0;
+                        }
+                    }
+                }
+                else if ($mode == 1) {
+                    if (preg_match('/BODY\[HEADER\.FIELDS \("?(FROM|REPLY-TO|SENDER|TO|SUBJECT)"?\)\] (.*)/', $line, $matches)) {
+                        $value = preg_replace(array('/^"*[a-z]+:/i', '/\s+$/sm'), array('', ''), $matches[2]);
+                        $result[$id] = trim($value);
+                    }
+                    else {
+                        $result[$id] = '';
+                    }
+                }
+                else if ($mode == 2) {
+                    if (preg_match('/' . $index_field . ' ([0-9]+)/', $line, $matches)) {
+                        $result[$id] = trim($matches[1]);
+                    }
+                    else {
+                        $result[$id] = 0;
+                    }
+                }
+                else if ($mode == 3) {
+                    if (!$flags && preg_match('/FLAGS \(([^)]+)\)/', $line, $matches)) {
+                        $flags = explode(' ', $matches[1]);
+                    }
+                    $result[$id] = in_array("\\".$index_field, (array) $flags) ? 1 : 0;
+                }
+                else if ($mode == 4) {
+                    if (preg_match('/INTERNALDATE "([^"]+)"/', $line, $matches)) {
+                        $result[$id] = Helper::strtotime($matches[1]);
+                    }
+                    else {
+                        $result[$id] = 0;
+                    }
+                }
+            }
+        }while (!$this->startsWith($line, $key, true, true));
+
+        return $result;
+    }
+
+    /**
+     * Returns message(s) data (flags, headers, etc.)
+     *
+     * @param string $mailbox     Mailbox name
+     * @param mixed  $message_set Message(s) sequence identifier(s) or UID(s)
+     * @param bool   $is_uid      True if $message_set contains UIDs
+     * @param bool   $bodystr     Enable to add BODYSTRUCTURE data to the result
+     * @param array  $add_headers List of additional headers
+     *
+     * @return bool|array List of rcube_message_header elements, False on error
+     */
+    public function fetchHeaders($mailbox, $message_set, $is_uid = false, $bodystr = false, $add_headers = array())
+    {
+        $query_items = array('UID', 'RFC822.SIZE', 'FLAGS', 'INTERNALDATE');
+        $headers     = array('DATE', 'FROM', 'TO', 'SUBJECT', 'CONTENT-TYPE', 'CC', 'REPLY-TO',
+            'LIST-POST', 'DISPOSITION-NOTIFICATION-TO', 'X-PRIORITY');
+
+        if (!empty($add_headers)) {
+            $add_headers = array_map('strtoupper', $add_headers);
+            $headers     = array_unique(array_merge($headers, $add_headers));
+        }
+
+        if ($bodystr) {
+            $query_items[] = 'BODYSTRUCTURE';
+        }
+
+        $query_items[] = 'BODY.PEEK[HEADER.FIELDS (' . implode(' ', $headers) . ')]';
+
+        return $this->fetch($mailbox, $message_set, $is_uid, $query_items);
+    }
+
+    /**
+     * FETCH command (RFC3501)
+     *
+     * @param string $mailbox     Mailbox name
+     * @param mixed  $message_set Message(s) sequence identifier(s) or UID(s)
+     * @param bool   $is_uid      True if $message_set contains UIDs
+     * @param array  $query_items FETCH command data items
+     * @param string $mod_seq     Modification sequence for CHANGEDSINCE (RFC4551) query
+     * @param bool   $vanished    Enables VANISHED parameter (RFC5162) for CHANGEDSINCE query
+     *
+     * @return array List of rcube_message_header elements, False on error
+     * @since 0.6
+     */
+    public function fetch($mailbox, $message_set, $is_uid = false, $query_items = array(),
+        $mod_seq = null, $vanished = false)
+    {
+        if (!$this->select($mailbox)) {
+            return false;
+        }
+
+        $message_set = Helper::compressMessageSet($message_set);
+        $result      = array();
+
+        $key      = $this->nextTag();
+        $cmd      = ($is_uid ? 'UID ' : '') . 'FETCH';
+        $request  = "$key $cmd $message_set (" . implode(' ', $query_items) . ")";
+
+        if ($mod_seq !== null && $this->hasCapability('CONDSTORE')) {
+            $request .= " (CHANGEDSINCE $mod_seq" . ($vanished ? " VANISHED" : '') .")";
+        }
+
+        if (!$this->putLine($request)) {
+            $this->setError(self::ERROR_COMMAND, "Failed to send $cmd command");
+            return false;
+        }
+
+        do {
+            $line = $this->readLine(4096);
+
+            if (!$line) {
+                break;
+            }
+
+            // Sample reply line:
+            // * 321 FETCH (UID 2417 RFC822.SIZE 2730 FLAGS (\Seen)
+            // INTERNALDATE "16-Nov-2008 21:08:46 +0100" BODYSTRUCTURE (...)
+            // BODY[HEADER.FIELDS ...
+
+            if (preg_match('/^\* ([0-9]+) FETCH/', $line, $m)) {
+                $id = intval($m[1]);
+
+                $result[$id]            = new MessageHeader;
+                $result[$id]->id        = $id;
+                $result[$id]->subject   = '';
+                $result[$id]->messageID = 'mid:' . $id;
+
+                $headers = null;
+                $lines   = array();
+                $line    = substr($line, strlen($m[0]) + 2);
+                $ln      = 0;
+
+                // get complete entry
+                while (preg_match('/\{([0-9]+)\}\r\n$/', $line, $m)) {
+                    $bytes = $m[1];
+                    $out   = '';
+
+                    while (strlen($out) < $bytes) {
+                        $out = $this->readBytes($bytes);
+                        if ($out === null) {
+                            break;
+                        }
+                        $line .= $out;
+                    }
+
+                    $str = $this->readLine(4096);
+                    if ($str === false) {
+                        break;
+                    }
+
+                    $line .= $str;
+                }
+
+                // Tokenize response and assign to object properties
+                while (list($name, $value) = Helper::tokenizeResponse($line, 2)) {
+                    if ($name == 'UID') {
+                        $result[$id]->uid = intval($value);
+                    }
+                    else if ($name == 'RFC822.SIZE') {
+                        $result[$id]->size = intval($value);
+                    }
+                    else if ($name == 'RFC822.TEXT') {
+                        $result[$id]->body = $value;
+                    }
+                    else if ($name == 'INTERNALDATE') {
+                        $result[$id]->internaldate = $value;
+                        $result[$id]->date         = $value;
+                        $result[$id]->timestamp    = Helper::strtotime($value);
+                    }
+                    else if ($name == 'FLAGS') {
+                        if (!empty($value)) {
+                            foreach ((array)$value as $flag) {
+                                $flag = str_replace(array('$', "\\"), '', $flag);
+                                $flag = strtoupper($flag);
+
+                                $result[$id]->flags[$flag] = true;
+                            }
+                        }
+                    }
+                    else if ($name == 'MODSEQ') {
+                        $result[$id]->modseq = $value[0];
+                    }
+                    else if ($name == 'ENVELOPE') {
+                        $result[$id]->envelope = $value;
+                    }
+                    else if ($name == 'BODYSTRUCTURE' || ($name == 'BODY' && count($value) > 2)) {
+                        if (!is_array($value[0]) && (strtolower($value[0]) == 'message' && strtolower($value[1]) == 'rfc822')) {
+                            $value = array($value);
+                        }
+                        $result[$id]->bodystructure = $value;
+                    }
+                    else if ($name == 'RFC822') {
+                        $result[$id]->body = $value;
+                    }
+                    else if (stripos($name, 'BODY[') === 0) {
+                        $name = str_replace(']', '', substr($name, 5));
+
+                        if ($name == 'HEADER.FIELDS') {
+                            // skip ']' after headers list
+                            Helper::tokenizeResponse($line, 1);
+                            $headers = Helper::tokenizeResponse($line, 1);
+                        }
+                        else if (strlen($name)) {
+                            $result[$id]->bodypart[$name] = $value;
+                        }
+                        else {
+                            $result[$id]->body = $value;
+                        }
+                    }
+                }
+
+                // create array with header field:data
+                if (!empty($headers)) {
+                    $headers = explode("\n", trim($headers));
+                    foreach ($headers as $resln) {
+                        if (ord($resln[0]) <= 32) {
+                            $lines[$ln] .= (empty($lines[$ln]) ? '' : "\n") . trim($resln);
+                        }
+                        else {
+                            $lines[++$ln] = trim($resln);
+                        }
+                    }
+
+                    foreach ($lines as $str) {
+                        list($field, $string) = explode(':', $str, 2);
+
+                        $field  = strtolower($field);
+                        $string = preg_replace('/\n[\t\s]*/', ' ', trim($string));
+
+                        switch ($field) {
+                            case 'date';
+                            $result[$id]->date = $string;
+                            $result[$id]->timestamp = Helper::strtotime($string);
+                            break;
+                        case 'to':
+                            $result[$id]->to = preg_replace('/undisclosed-recipients:[;,]*/', '', $string);
+                            break;
+                        case 'from':
+                        case 'subject':
+                        case 'cc':
+                        case 'bcc':
+                        case 'references':
+                            $result[$id]->{$field} = $string;
+                            break;
+                        case 'reply-to':
+                            $result[$id]->replyto = $string;
+                            break;
+                        case 'content-transfer-encoding':
+                            $result[$id]->encoding = $string;
+                            break;
+                        case 'content-type':
+                            $ctype_parts = preg_split('/[; ]+/', $string);
+                            $result[$id]->ctype = strtolower(array_shift($ctype_parts));
+                            if (preg_match('/charset\s*=\s*"?([a-z0-9\-\.\_]+)"?/i', $string, $regs)) {
+                                $result[$id]->charset = $regs[1];
+                            }
+                            break;
+                        case 'in-reply-to':
+                            $result[$id]->in_reply_to = str_replace(array("\n", '<', '>'), '', $string);
+                            break;
+                        case 'return-receipt-to':
+                        case 'disposition-notification-to':
+                        case 'x-confirm-reading-to':
+                            $result[$id]->mdn_to = $string;
+                            break;
+                        case 'message-id':
+                            $result[$id]->messageID = $string;
+                            break;
+                        case 'x-priority':
+                            if (preg_match('/^(\d+)/', $string, $matches)) {
+                                $result[$id]->priority = intval($matches[1]);
+                            }
+                            break;
+                        default:
+                            if (strlen($field) < 3) {
+                                break;
+                            }
+                            if (isset($result[$id]->others[$field])) {
+                                $string = array_merge((array)$result[$id]->others[$field], (array)$string);
+                            }
+                            $result[$id]->others[$field] = $string;
+                        }
+                    }
+                }
+            }
+            // VANISHED response (QRESYNC RFC5162)
+            // Sample: * VANISHED (EARLIER) 300:310,405,411
+            else if (preg_match('/^\* VANISHED [()EARLIER]*/i', $line, $match)) {
+                $line   = substr($line, strlen($match[0]));
+                $v_data = Helper::tokenizeResponse($line, 1);
+
+                $this->data['VANISHED'] = $v_data;
+            }
+        }
+        while (!$this->startsWith($line, $key, true));
+
+        return $result;
+    }
 }

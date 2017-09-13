@@ -298,4 +298,322 @@ class Helper
 
         return $result;
     }
+
+    /**
+     * Clean up date string for strtotime() input
+     *
+     * @param string $date Date string
+     *
+     * @return string Date string
+     */
+    public static function clean_datestr($date)
+    {
+        $date = trim($date);
+
+        // check for MS Outlook vCard date format YYYYMMDD
+        if (preg_match('/^([12][90]\d\d)([01]\d)([0123]\d)$/', $date, $m)) {
+            return sprintf('%04d-%02d-%02d 00:00:00', intval($m[1]), intval($m[2]), intval($m[3]));
+        }
+
+        // Clean malformed data
+        $date = preg_replace(
+            array(
+                '/GMT\s*([+-][0-9]+)/',                     // support non-standard "GMTXXXX" literal
+                '/[^a-z0-9\x20\x09:+-\/]/i',                // remove any invalid characters
+                '/\s*(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s*/i',   // remove weekday names
+            ),
+            array(
+                '\\1',
+                '',
+                '',
+            ), $date);
+
+        $date = trim($date);
+
+        // try to fix dd/mm vs. mm/dd discrepancy, we can't do more here
+        if (preg_match('/^(\d{1,2})[.\/-](\d{1,2})[.\/-](\d{4})(\s.*)?$/', $date, $m)) {
+            $mdy   = $m[2] > 12 && $m[1] <= 12;
+            $day   = $mdy ? $m[2] : $m[1];
+            $month = $mdy ? $m[1] : $m[2];
+            $date  = sprintf('%04d-%02d-%02d%s', $m[3], $month, $day, $m[4] ?: ' 00:00:00');
+        }
+        // I've found that YYYY.MM.DD is recognized wrong, so here's a fix
+        else if (preg_match('/^(\d{4})\.(\d{1,2})\.(\d{1,2})(\s.*)?$/', $date, $m)) {
+            $date  = sprintf('%04d-%02d-%02d%s', $m[1], $m[2], $m[3], $m[4] ?: ' 00:00:00');
+        }
+
+        return $date;
+    }
+
+    /**
+     * Improved equivalent to strtotime()
+     *
+     * @param string       $date     Date string
+     * @param DateTimeZone $timezone Timezone to use for DateTime object
+     *
+     * @return int Unix timestamp
+     */
+    public static function strtotime($date, $timezone = null)
+    {
+        $date   = self::clean_datestr($date);
+        $tzname = $timezone ? ' ' . $timezone->getName() : '';
+
+        // unix timestamp
+        if (is_numeric($date)) {
+            return (int) $date;
+        }
+
+        // if date parsing fails, we have a date in non-rfc format.
+        // remove token from the end and try again
+        while ((($ts = @strtotime($date . $tzname)) === false) || ($ts < 0)) {
+            $d = explode(' ', $date);
+            array_pop($d);
+            if (!$d) {
+                break;
+            }
+            $date = implode(' ', $d);
+        }
+
+        return (int) $ts;
+    }
+
+ /**
+     * Replacing specials characters to a specific encoding type
+     *
+     * @param string  Input string
+     * @param string  Encoding type: text|html|xml|js|url
+     * @param string  Replace mode for tags: show|remove|strict
+     * @param boolean Convert newlines
+     *
+     * @return string The quoted string
+     */
+    public static function rep_specialchars_output($str, $enctype = '', $mode = '', $newlines = true)
+    {
+        static $html_encode_arr = false;
+        static $js_rep_table    = false;
+        static $xml_rep_table   = false;
+
+        if (!is_string($str)) {
+            $str = strval($str);
+        }
+
+        // encode for HTML output
+        if ($enctype == 'html') {
+            if (!$html_encode_arr) {
+                $html_encode_arr = get_html_translation_table(HTML_SPECIALCHARS);
+                unset($html_encode_arr['?']);
+            }
+
+            $encode_arr = $html_encode_arr;
+
+            if ($mode == 'remove') {
+                $str = strip_tags($str);
+            }
+            else if ($mode != 'strict') {
+                // don't replace quotes and html tags
+                $ltpos = strpos($str, '<');
+                if ($ltpos !== false && strpos($str, '>', $ltpos) !== false) {
+                    unset($encode_arr['"']);
+                    unset($encode_arr['<']);
+                    unset($encode_arr['>']);
+                    unset($encode_arr['&']);
+                }
+            }
+
+            $out = strtr($str, $encode_arr);
+
+            return $newlines ? nl2br($out) : $out;
+        }
+
+        // if the replace tables for XML and JS are not yet defined
+        if ($js_rep_table === false) {
+            $js_rep_table = $xml_rep_table = array();
+            $xml_rep_table['&'] = '&amp;';
+
+            // can be increased to support more charsets
+            for ($c=160; $c<256; $c++) {
+                $xml_rep_table[chr($c)] = "&#$c;";
+            }
+
+            $xml_rep_table['"'] = '&quot;';
+            $js_rep_table['"']  = '\\"';
+            $js_rep_table["'"]  = "\\'";
+            $js_rep_table["\\"] = "\\\\";
+            // Unicode line and paragraph separators (#1486310)
+            $js_rep_table[chr(hexdec('E2')).chr(hexdec('80')).chr(hexdec('A8'))] = '&#8232;';
+            $js_rep_table[chr(hexdec('E2')).chr(hexdec('80')).chr(hexdec('A9'))] = '&#8233;';
+        }
+
+        // encode for javascript use
+        if ($enctype == 'js') {
+            return preg_replace(array("/\r?\n/", "/\r/", '/<\\//'), array('\n', '\n', '<\\/'), strtr($str, $js_rep_table));
+        }
+
+        // encode for plaintext
+        if ($enctype == 'text') {
+            return str_replace("\r\n", "\n", $mode == 'remove' ? strip_tags($str) : $str);
+        }
+
+        if ($enctype == 'url') {
+            return rawurlencode($str);
+        }
+
+        // encode for XML
+        if ($enctype == 'xml') {
+            return strtr($str, $xml_rep_table);
+        }
+
+        // no encoding given -> return original string
+        return $str;
+    }
+
+      /*
+     * Idn_to_ascii wrapper.
+     * Intl/Idn modules version of this function doesn't work with e-mail address
+     */
+    public static function idn_to_ascii($str)
+    {
+        return self::idn_convert($str, true);
+    }
+
+    /*
+     * Idn_to_ascii wrapper.
+     * Intl/Idn modules version of this function doesn't work with e-mail address
+     */
+    public static function idn_to_utf8($str)
+    {
+        return self::idn_convert($str, false);
+    }
+
+    public static function idn_convert($input, $is_utf = false)
+    {
+        if ($at = strpos($input, '@')) {
+            $user   = substr($input, 0, $at);
+            $domain = substr($input, $at+1);
+        }
+        else {
+            $domain = $input;
+        }
+
+        $domain = $is_utf ? idn_to_ascii($domain) : idn_to_utf8($domain);
+
+        if ($domain === false) {
+            return '';
+        }
+
+        return $at ? $user . '@' . $domain : $domain;
+    }
+
+     /**
+     * Generate a random string
+     *
+     * @param int  $length String length
+     * @param bool $raw    Return RAW data instead of ascii
+     *
+     * @return string The generated random string
+     */
+    public static function random_bytes($length, $raw = false)
+    {
+        $hextab  = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        $tabsize = strlen($hextab);
+
+        // Use PHP7 true random generator
+        if ($raw && function_exists('random_bytes')) {
+            return random_bytes($length);
+        }
+
+        if (!$raw && function_exists('random_int')) {
+            $result = '';
+            while ($length-- > 0) {
+                $result .= $hextab[random_int(0, $tabsize - 1)];
+            }
+
+            return $result;
+        }
+
+        $random = openssl_random_pseudo_bytes($length);
+
+        if ($random === false) {
+            throw new Exception("Failed to get random bytes");
+        }
+
+        if (!$raw) {
+            for ($x = 0; $x < $length; $x++) {
+                $random[$x] = $hextab[ord($random[$x]) % $tabsize];
+            }
+        }
+
+        return $random;
+    }
+
+    /**
+     * Convert binary data into readable form (containing a-zA-Z0-9 characters)
+     *
+     * @param string $input Binary input
+     *
+     * @return string Readable output (Base62)
+     * @deprecated since 1.3.1
+     */
+    public static function bin2ascii($input)
+    {
+        $hextab = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        $result = '';
+
+        for ($x = 0; $x < strlen($input); $x++) {
+            $result .= $hextab[ord($input[$x]) % 62];
+        }
+
+        return $result;
+    }
+
+    /**
+     * Format current date according to specified format.
+     * This method supports microseconds (u).
+     *
+     * @param string $format Date format (default: 'd-M-Y H:i:s O')
+     *
+     * @return string Formatted date
+     */
+    public static function date_format($format = null)
+    {
+        if (empty($format)) {
+            $format = 'd-M-Y H:i:s O';
+        }
+
+        if (strpos($format, 'u') !== false) {
+            $dt  = number_format(microtime(true), 6, '.', '');
+            $dt .=  '.' . date_default_timezone_get();
+
+            if ($date = date_create_from_format('U.u.e', $dt)) {
+                return $date->format($format);
+            }
+        }
+
+        return date($format);
+    }
+
+    public static function show_bytes($bytes, $unit = null)
+    {
+        if ($bytes >= 1073741824) {
+            $unit = 'GB';
+            $gb   = $bytes/1073741824;
+            $str  = sprintf($gb >= 10 ? "%d " : "%.1f ", $gb) . $unit;
+        }
+        else if ($bytes >= 1048576) {
+            $unit = 'MB';
+            $mb   = $bytes/1048576;
+            $str  = sprintf($mb >= 10 ? "%d " : "%.1f ", $mb) . $unit;
+        }
+        else if ($bytes >= 1024) {
+            $unit = 'KB';
+            $str  = sprintf("%d ",  round($bytes/1024)) . $unit;
+        }
+        else {
+            $unit = 'B';
+            $str  = sprintf('%d ', $bytes) . $unit;
+        }
+
+        return $str;
+    }  
+
 }

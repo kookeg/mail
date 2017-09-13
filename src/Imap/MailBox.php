@@ -596,7 +596,8 @@ class MailBox
         return $result == Error::ERROR_OK;
     }
 
-    protected function validName()
+
+    public function validName()
     {
         return $this->name && $this->name != '*';
     }
