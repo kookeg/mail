@@ -92,7 +92,7 @@ class ResultThread
      */
     public function count()
     {
-        if ($this->meta['count'] !== null)
+        if (isset($this->meta['count']) && !is_null($this->meta['count']))
             return $this->meta['count'];
 
         if (empty($this->raw_data)) {
