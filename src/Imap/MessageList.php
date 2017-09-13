@@ -18,11 +18,26 @@ class MessageList
 
     protected $search    = '';
 
+    protected $mode      = 'ALL'; //ALL|THREADS|UNSEEN|RECENT|EXISTS
+
+    protected $threading = '';
+
 
     public function __construct(MailBox $mailBox = null)
     {
         $this->setMailBox($mailBox); 
     }
+
+
+    public function count()
+    {
+
+       $this->getMailBox(); 
+       return $this->_countMessage();
+
+    }
+
+
 
 
     public function all()
@@ -40,7 +55,11 @@ class MessageList
         $allIndex = $index->get();
         $headers  = $this->fetchHeaders($allIndex);
 
-        return Format::formatMessageList(array_values($headers), $this->mailBox->getName(), $this->mailBox->getImap()->delimiter);
+        return Format::formatMessageList(
+            array_values($headers)
+            , $this->mailBox->getName()
+            , $this->mailBox->getImap()->delimiter
+        );
     }
 
     /**
@@ -190,10 +209,77 @@ class MessageList
     public function setSearch($searchStr = '')
     {
         $this->search = $searchStr; 
+        return $this;
     }
 
 
+    public function setMode($mode = 'ALL')
+    {
+        $this->mode = $mode;
+        return $this;
+    }
 
 
+    protected function _countMessage()
+    {
 
+        $mode = strtoupper($this->mode);
+        if ($mode == 'THREADS') {
+            $res   = $this->threads($this->mailBox->getName());
+            $count = $res->count();
+        }else if ($mode == 'RECENT') {
+            $count = $this
+                ->mailBox 
+                ->getImap()
+                ->getConnection()
+                ->countRecent($this->mailBox->getName());
+        }else if ($mode != 'EXISTS' && !GlobalVar::get('skip_deleted')) {
+            $search_str = "ALL UNDELETED";
+            $keys       = array('COUNT');
+            if ($mode == 'UNSEEN') {
+                $search_str .= " UNSEEN";
+            }
+            $index = $this
+                ->mailBox 
+                ->getImap()
+                ->getConnection()
+                ->search($this->mailBox->getName(), $search_str, true, $keys);
+            $count = $index->count();
+        }else {
+            if ($mode == 'UNSEEN') {
+                $count = $this
+                    ->mailBox 
+                    ->getImap()
+                    ->getConnection()
+                    ->countUnseen($this->mailBox->getName());
+            }else {
+                $count = $this
+                    ->mailBox 
+                    ->getImap()
+                    ->getConnection()
+                    ->countMessages($this->mailBox->getName());
+            }
+        }
+        return (int)$count;  
+    }
+
+    public function threads()
+    {
+        return $this
+            ->mailBox
+            ->getImap()
+            ->getConnection()
+            ->thread(
+                $this->mailBox->getName()
+                , $this->threading
+                , GlobalVar::get('skip_deleted') ? 'UNDELETED' : ''
+                , true
+            ); 
+    }
+
+    public function setThreading($threading = '')
+    {
+        $this->threading = $threading; 
+        return $this;
+    }
 }

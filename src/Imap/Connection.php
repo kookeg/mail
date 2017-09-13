@@ -1585,4 +1585,201 @@ class Connection
 
         return $result;
     }
+
+    /**
+     * Executes THREAD command
+     *
+     * @param string $mailbox    Mailbox name
+     * @param string $algorithm  Threading algorithm (ORDEREDSUBJECT, REFERENCES, REFS)
+     * @param string $criteria   Searching criteria
+     * @param bool   $return_uid Enables UIDs in result instead of sequence numbers
+     * @param string $encoding   Character set
+     *
+     * @return ResultThread Thread data
+     */
+    public function thread(
+        $mailbox
+        , $algorithm = 'REFERENCES'
+        , $criteria = ''
+        , $return_uid = false
+        , $encoding = 'US-ASCII'
+    )
+    {
+
+        if (!$this->select($mailbox)) {
+            return new ResulThread($mailbox);
+        }
+
+        if (!$this->data['EXISTS']) {
+            return new ResulThread($mailbox, '* THREAD');
+        }
+
+        $encoding  = $encoding ? trim($encoding) : 'US-ASCII';
+        $algorithm = $algorithm ? trim($algorithm) : 'REFERENCES';
+        $criteria  = $criteria ? 'ALL '.trim($criteria) : 'ALL';
+
+        list($code, $response) = $this->execute($return_uid ? 'UID THREAD' : 'THREAD',
+            array($algorithm, $encoding, $criteria));
+
+        $response = $code != Error::ERROR_OK ? null : $response;
+        return ResulThread($mailbox, $response);
+    }
+
+
+    /**
+     * Returns count of all messages in a folder
+     *
+     * @param string $mailbox Mailbox name
+     *
+     * @return int Number of messages, False on error
+     */
+    public function countMessages($mailbox)
+    {
+        $counts = $this->status($mailbox);
+        if (is_array($counts)) {
+            return (int) $counts['MESSAGES'];
+        }
+        return 0;
+    }
+
+    /**
+     * Returns count of messages with \Recent flag in a folder
+     *
+     * @param string $mailbox Mailbox name
+     *
+     * @return int Number of messages, False on error
+     */
+    public function countRecent($mailbox)
+    {
+        $cache = $this->data['STATUS:'.$mailbox];
+        if (!empty($cache) && isset($cache['RECENT'])) {
+            return (int) $cache['RECENT'];
+        }
+
+        $counts = $this->status($mailbox, array('RECENT'));
+        if (is_array($counts)) {
+            return (int) $counts['RECENT'];
+        }
+
+        return false;
+    }
+
+    /**
+     * Returns count of messages without \Seen flag in a specified folder
+     *
+     * @param string $mailbox Mailbox name
+     *
+     * @return int Number of messages, False on error
+     */
+    public function countUnseen($mailbox)
+    {
+        // Check internal cache
+        $cache = $this->data['STATUS:'.$mailbox];
+        if (!empty($cache) && isset($cache['UNSEEN'])) {
+            return (int) $cache['UNSEEN'];
+        }
+
+        // Try STATUS (should be faster than SELECT+SEARCH)
+        $counts = $this->status($mailbox);
+        if (is_array($counts)) {
+            return (int) $counts['UNSEEN'];
+        }
+
+        // Invoke SEARCH as a fallback
+        $index = $this->search($mailbox, 'ALL UNSEEN', false, array('COUNT'));
+        if (!$index->is_error()) {
+            return $index->count();
+        }
+
+        return false;
+    }
+
+
+    /**
+     * Executes STATUS command
+     *
+     * @param string $mailbox Mailbox name
+     * @param array  $items   Additional requested item names. By default
+     *                        MESSAGES and UNSEEN are requested. Other defined
+     *                        in RFC3501: UIDNEXT, UIDVALIDITY, RECENT
+     *
+     * @return array Status item-value hash
+     * @since 0.5-beta
+     */
+    public function status($mailbox, $items = array())
+    {
+        if (!strlen($mailbox)) {
+            return false;
+        }
+
+        if (!in_array('MESSAGES', $items)) {
+            $items[] = 'MESSAGES';
+        }
+        if (!in_array('UNSEEN', $items)) {
+            $items[] = 'UNSEEN';
+        }
+
+        list($code, $response) = $this->execute('STATUS', array(Helper::escape($mailbox),
+            '(' . implode(' ', $items) . ')'));
+
+        if ($code == Error::ERROR_OK && preg_match('/^\* STATUS /i', $response)) {
+            $result   = array();
+            $response = substr($response, 9); // remove prefix "* STATUS "
+
+            list($mbox, $items) = Helper::tokenizeResponse($response, 2);
+
+            // Fix for #1487859. Some buggy server returns not quoted
+            // folder name with spaces. Let's try to handle this situation
+            if (!is_array($items) && ($pos = strpos($response, '(')) !== false) {
+                $response = substr($response, $pos);
+                $items    = Helper::tokenizeResponse($response, 1);
+            }
+
+            if (!is_array($items)) {
+                return $result;
+            }
+
+            for ($i=0, $len=count($items); $i<$len; $i += 2) {
+                $result[$items[$i]] = $items[$i+1];
+            }
+
+            $this->data['STATUS:'.$mailbox] = $result;
+            return $result;
+        }
+        return false;
+    }
+
+    /**
+     * Executes EXPUNGE command
+     *
+     * @param string       $mailbox  Mailbox name
+     * @param string|array $messages Message UIDs to expunge
+     *
+     * @return boolean True on success, False on error
+     */
+    public function expunge($mailbox, $messages = null)
+    {
+        if (!$this->select($mailbox)) {
+            return false;
+        }
+
+        if (!$this->data['READ-WRITE']) {
+            $this->setError(self::ERROR_READONLY, "Mailbox is read-only");
+            return false;
+        }
+
+        if (!empty($messages) && $messages != '*' && $this->hasCapability('UIDPLUS')) {
+            $messages = Helper::compressMessageSet($messages);
+            $result   = $this->execute('UID EXPUNGE', array($messages), Command::COMMAND_NORESPONSE);
+        }
+        else {
+            $result = $this->execute('EXPUNGE', null, Command::COMMAND_NORESPONSE);
+        }
+
+        if ($result == Error::ERROR_OK) {
+            return true;
+        }
+        return false;
+    }
+
 }
